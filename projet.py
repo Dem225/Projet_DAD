@@ -4,185 +4,204 @@ Script d'automatisation : attribution d'IP aux nouveaux sites sur les passerelle
 Prérequis :
     pip install pandas openpyxl
 
-Fichier Excel des NOUVEAUX SITES (entrée) - colonnes obligatoires :
-    site_name        -> nom du nouveau site
-    gateway_address   -> adresse de la passerelle (ex: 192.168.1.1)
-    gateway_mask      -> masque en notation CIDR (ex: 24)
+Fichiers d'entrée :
 
-Fichier d'INVENTAIRE des IP déjà utilisées (Excel ou CSV) - colonne obligatoire :
-    ip_address        -> une ligne par IP déjà attribuée (ex: 192.168.1.5)
-    (le nom de la colonne est configurable via le paramètre ip_column)
+1) Gateway.xlsx (liste des passerelles / sous-réseaux existants) - colonnes attendues :
+       Block d'adresse, Masque, vlanid, Technology, Router Gateway,
+       Vendor, Router hostname, Longitude, Latitude, Area, Nom du Router
+
+2) SiteID_List.xlsx (sites déjà raccordés, sert d'inventaire des IP utilisées) - colonnes attendues :
+       Site ID, Nom du site, Area, ..., Router Gateway, ...
+       puis pour chaque techno : "<Tech> IP", "<Tech> GW IP", "<Tech> vlanid"
+       (ex: "2G IP", "2G GW IP", "2G vlanid", "3G OaM IP", "3G OaM GW IP", ...)
+       Les IP de site sont au format "x.x.x.x/masque", les GW IP au format "x.x.x.x".
+
+3) Fichier des NOUVEAUX sites à ajouter - colonnes attendues :
+       Site ID (ou nom du site), Router Gateway, Technology
+       -> une ligne par (site, techno) à raccorder.
 """
 
 import ipaddress
-import platform
-import subprocess
-from pathlib import Path
+import re
 
 import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# Méthode 1 (recommandée) : détection via un fichier d'inventaire existant
-# ---------------------------------------------------------------------------
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Nettoie les noms de colonnes (espaces en trop, etc.)."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-def load_used_ips(inventory_path: str, ip_column: str = "ip_address") -> set[str]:
-    """
-    Charge la liste des IP déjà utilisées depuis un fichier Excel ou CSV.
-    Une ligne = une IP utilisée. Le nom de la colonne est configurable.
-    """
-    path = Path(inventory_path)
-    if path.suffix.lower() == ".csv":
-        df = pd.read_csv(inventory_path)
-    else:
-        df = pd.read_excel(inventory_path)
 
-    if ip_column not in df.columns:
+def load_gateways(path: str) -> pd.DataFrame:
+    """Charge Gateway.xlsx et nettoie les colonnes clés."""
+    df = _clean_columns(pd.read_excel(path))
+    df["Block d'adresse"] = df["Block d'adresse"].astype(str).str.strip()
+    df["Masque"] = df["Masque"].astype(str).str.strip()
+    df["Router Gateway"] = df["Router Gateway"].astype(str).str.strip()
+    df["Technology"] = df["Technology"].astype(str).str.strip()
+    return df
+
+
+def load_existing_sites(path: str) -> pd.DataFrame:
+    """Charge SiteID_List.xlsx (inventaire des sites/IP déjà utilisés)."""
+    return _clean_columns(pd.read_excel(path))
+
+
+def find_gateway_network(gateways_df: pd.DataFrame, router_gateway: str, technology: str):
+    """
+    Retourne (network, vlanid, row) pour le couple (Router Gateway, Technology) demandé.
+    Lève une erreur explicite si aucune correspondance (ou plusieurs) n'est trouvée.
+    """
+    match = gateways_df[
+        (gateways_df["Router Gateway"] == str(router_gateway).strip())
+        & (gateways_df["Technology"].str.upper() == str(technology).strip().upper())
+    ]
+
+    if match.empty:
         raise ValueError(
-            f"Colonne '{ip_column}' introuvable dans {inventory_path}. "
-            f"Colonnes disponibles : {list(df.columns)}"
+            f"Aucune passerelle trouvée pour Router Gateway='{router_gateway}' "
+            f"et Technology='{technology}'."
+        )
+    if len(match) > 1:
+        raise ValueError(
+            f"Plusieurs passerelles trouvées pour Router Gateway='{router_gateway}' "
+            f"et Technology='{technology}' — vérifie Gateway.xlsx (doublons)."
         )
 
-    return set(df[ip_column].astype(str).str.strip())
+    row = match.iloc[0]
+    block_address = row["Block d'adresse"]
+    mask = row["Masque"]
+    network = ipaddress.ip_network(f"{block_address}/{mask}", strict=False)
+    return network, row.get("vlanid"), row
 
 
-def get_used_and_free_ips_from_inventory(
-    address: str, mask: str, used_ips: set[str], exclude: list[str] | None = None
-):
+def _extract_ips_from_value(value) -> list[str]:
     """
-    Sépare les IP hôtes d'une passerelle entre utilisées / libres,
-    en se basant sur l'ensemble used_ips issu de l'inventaire (pas de ping).
+    Extrait une IP d'une cellule qui peut être 'x.x.x.x', 'x.x.x.x/masque',
+    vide, ou NaN. Retourne une liste (0 ou 1 élément) pour rester simple à agréger.
     """
-    exclude_set = set(exclude or [])
-    hosts = get_hosts(address, mask)
-
-    used, free = [], []
-    for ip in hosts:
-        if ip in exclude_set:
-            continue
-        if ip in used_ips:
-            used.append(ip)
-        else:
-            free.append(ip)
-    return used, free
+    if pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    ip_part = text.split("/")[0].strip()
+    if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip_part):
+        return []
+    return [ip_part]
 
 
-# ---------------------------------------------------------------------------
-# Méthode 2 (fallback) : détection par ping, si aucun inventaire n'existe
-# ---------------------------------------------------------------------------
-
-def is_ip_alive(ip: str, timeout: int = 1) -> bool:
+def get_used_ips_in_network(sites_df: pd.DataFrame, network: ipaddress.IPv4Network) -> set[str]:
     """
-    Vérifie si une IP répond au ping (donc considérée comme déjà utilisée).
-    ATTENTION : un appareil éteint ou qui bloque le ping (firewall) sera vu
-    comme "libre" même s'il a une IP réservée. Moins fiable qu'un inventaire.
+    Parcourt toutes les colonnes se terminant par 'IP' dans l'inventaire des sites
+    (IP attribuées ET GW IP), et retourne celles qui appartiennent au sous-réseau ciblé.
     """
-    is_windows = platform.system().lower() == "windows"
-    count_flag = "-n" if is_windows else "-c"
-    timeout_flag = "-w" if is_windows else "-W"
-    timeout_value = str(timeout * 1000) if is_windows else str(timeout)
+    ip_columns = [c for c in sites_df.columns if c.strip().upper().endswith("IP")]
 
-    cmd = ["ping", count_flag, "1", timeout_flag, timeout_value, ip]
-    try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout + 1
-        )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        return False
-
-
-def get_used_and_free_ips_by_ping(address: str, mask: str, exclude: list[str] | None = None):
-    """Scanne le sous-réseau via ping. Retourne (ip_utilisees, ip_libres)."""
-    exclude_set = set(exclude or [])
-    hosts = get_hosts(address, mask)
-
-    used, free = [], []
-    for ip in hosts:
-        if ip in exclude_set:
-            continue
-        if is_ip_alive(ip):
-            used.append(ip)
-        else:
-            free.append(ip)
-    return used, free
+    used = set()
+    for col in ip_columns:
+        for value in sites_df[col]:
+            for ip_str in _extract_ips_from_value(value):
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                except ValueError:
+                    continue
+                if ip_obj in network:
+                    used.add(str(ip_obj))
+    return used
 
 
-# ---------------------------------------------------------------------------
-# Commun
-# ---------------------------------------------------------------------------
-
-def get_hosts(address: str, mask: str) -> list[str]:
-    """
-    Retourne toutes les IP hôtes utilisables du sous-réseau (hors réseau/broadcast).
-    mask est attendu en notation CIDR (ex: "24").
-    """
-    network = ipaddress.ip_network(f"{address}/{mask}", strict=False)
-    return [str(ip) for ip in network.hosts()]
+def get_next_free_ip(network: ipaddress.IPv4Network, used_ips: set[str]) -> str | None:
+    """Retourne la première IP libre du sous-réseau (hors réseau/broadcast/déjà utilisées)."""
+    for host in network.hosts():
+        if str(host) not in used_ips:
+            return str(host)
+    return None
 
 
-def process_excel(
-    input_path: str,
+def process_new_sites(
+    new_sites_path: str,
+    gateway_path: str,
+    siteid_path: str,
     output_path: str,
-    inventory_path: str | None = None,
-    ip_column: str = "ip_address",
 ) -> pd.DataFrame:
     """
-    Lit le fichier Excel des nouveaux sites, attribue une IP libre à chacun
-    dans la passerelle indiquée, et écrit un fichier de résultat.
-
-    Si inventory_path est fourni -> détection via l'inventaire (recommandé).
-    Sinon -> détection par ping (fallback, moins fiable).
+    Pour chaque ligne du fichier des nouveaux sites (Site ID / Nom, Router Gateway, Technology),
+    trouve le sous-réseau correspondant, calcule la première IP libre et l'attribue.
+    Écrit un fichier de résultat avec le statut de chaque attribution.
     """
-    df = pd.read_excel(input_path)
+    new_sites_df = _clean_columns(pd.read_excel(new_sites_path))
+    gateways_df = load_gateways(gateway_path)
+    sites_df = load_existing_sites(siteid_path)
 
-    required_cols = {"site_name", "gateway_address", "gateway_mask"}
-    missing = required_cols - set(df.columns)
+    required_cols = {"Router Gateway", "Technology"}
+    missing = required_cols - set(new_sites_df.columns)
     if missing:
-        raise ValueError(f"Colonnes manquantes dans l'Excel : {missing}")
+        raise ValueError(f"Colonnes manquantes dans le fichier des nouveaux sites : {missing}")
 
-    all_used_ips = load_used_ips(inventory_path, ip_column) if inventory_path else None
+    site_label_col = "Site ID" if "Site ID" in new_sites_df.columns else new_sites_df.columns[0]
 
     results = []
-    # Cache pour ne scanner chaque passerelle qu'une seule fois même si
-    # plusieurs sites lui sont rattachés dans le fichier.
-    gateway_cache: dict[tuple[str, str], tuple[list[str], list[str]]] = {}
+    # Cache pour ne pas recalculer les IP utilisées à chaque ligne pour le même sous-réseau,
+    # et pour éviter d'attribuer deux fois la même IP à deux nouveaux sites du même fichier.
+    network_cache: dict[tuple[str, str], tuple[ipaddress.IPv4Network, set[str], object]] = {}
 
-    for _, row in df.iterrows():
-        site = row["site_name"]
-        addr = str(row["gateway_address"]).strip()
-        mask = str(row["gateway_mask"]).strip()
-        key = (addr, mask)
+    for _, row in new_sites_df.iterrows():
+        site_label = row[site_label_col]
+        router_gw = str(row["Router Gateway"]).strip()
+        technology = str(row["Technology"]).strip()
+        key = (router_gw, technology.upper())
 
-        if key not in gateway_cache:
-            if all_used_ips is not None:
-                gateway_cache[key] = get_used_and_free_ips_from_inventory(
-                    addr, mask, all_used_ips, exclude=[addr]
+        try:
+            if key not in network_cache:
+                network, vlanid, gw_row = find_gateway_network(gateways_df, router_gw, technology)
+                used_ips = get_used_ips_in_network(sites_df, network)
+                network_cache[key] = (network, used_ips, vlanid)
+
+            network, used_ips, vlanid = network_cache[key]
+            free_ip = get_next_free_ip(network, used_ips)
+
+            if free_ip is None:
+                results.append(
+                    {
+                        "Site ID": site_label,
+                        "Router Gateway": router_gw,
+                        "Technology": technology,
+                        "Sous-reseau": str(network),
+                        "vlanid": vlanid,
+                        "assigned_ip": None,
+                        "status": "AUCUNE PLACE LIBRE",
+                    }
                 )
-            else:
-                gateway_cache[key] = get_used_and_free_ips_by_ping(addr, mask, exclude=[addr])
+                continue
 
-        used, free = gateway_cache[key]
+            used_ips.add(free_ip)  # réserve l'IP pour ne pas la réattribuer plus loin dans le fichier
+            results.append(
+                {
+                    "Site ID": site_label,
+                    "Router Gateway": router_gw,
+                    "Technology": technology,
+                    "Sous-reseau": str(network),
+                    "vlanid": vlanid,
+                    "assigned_ip": f"{free_ip}/{network.prefixlen}",
+                    "status": "OK",
+                }
+            )
 
-        if free:
-            assigned_ip = free.pop(0)
-            used.append(assigned_ip)
-            if all_used_ips is not None:
-                all_used_ips.add(assigned_ip)  # évite de réattribuer la même IP à 2 sites du fichier
-            status = "OK"
-        else:
-            assigned_ip = None
-            status = "AUCUNE PLACE LIBRE"
-
-        results.append(
-            {
-                "site_name": site,
-                "gateway_address": addr,
-                "gateway_mask": mask,
-                "assigned_ip": assigned_ip,
-                "status": status,
-            }
-        )
+        except ValueError as exc:
+            results.append(
+                {
+                    "Site ID": site_label,
+                    "Router Gateway": router_gw,
+                    "Technology": technology,
+                    "Sous-reseau": None,
+                    "vlanid": None,
+                    "assigned_ip": None,
+                    "status": f"ERREUR: {exc}",
+                }
+            )
 
     result_df = pd.DataFrame(results)
     result_df.to_excel(output_path, index=False)
@@ -191,9 +210,9 @@ def process_excel(
 
 
 if __name__ == "__main__":
-    process_excel(
-        input_path="nouveaux_sites.xlsx",
+    process_new_sites(
+        new_sites_path="nouveaux_sites.xlsx",
+        gateway_path="Gateway.xlsx",
+        siteid_path="SiteID_List.xlsx",
         output_path="resultats_attribution.xlsx",
-        inventory_path="inventaire_ip.xlsx",   # ou "inventaire_ip.csv"
-        ip_column="ip_address",
     )
