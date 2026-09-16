@@ -1,0 +1,36 @@
+vscode_lsp_terminal_prompt_tracker= {}ue je t'ai donné, tu n 'as plus besoin de modifier le fichier à chaque fois — tu passes juste les infos du site en argument dans le terminal.
+
+Pour ajouter UN site
+bash
+python main.py ajouter --site AC777 --gateway AC622 --tech 3G --nom "NOM DU SITE"
+--site : l'identifiant du nouveau site (ex: AC777)
+--gateway : le routeur auquel il se rattache (doit exister dans Gateway.xlsx, ex: AC622)
+--tech : une ou plusieurs technologies, séparées par des espaces (ex: --tech 2G 3G 5G)
+--nom : optionnel, le nom du site
+Pour ajouter PLUSIEURS sites d'un coup
+
+Prépare un Excel avec les colonnes Site ID, Router Gateway, Technology (une ligne par site+techno), puis :
+
+bash
+python main.py import nouveaux_sites.xlsx
+Si tu ne connais pas les valeurs possibles (Router Gateway, Technology)
+
+Pas besoin de chercher à la main dans Excel — tu peux interroger directement la base :
+
+Résumé des 4 commandes disponibles maintenant, sans jamais toucher au code :
+
+bash
+python main.py init                                              # (re)charger Gateway.xlsx
+python main.py chercher                                          # voir toutes les passerelles dispo
+python main.py chercher --gateway AC622                          # voir les technos dispo pour un routeur
+python main.py ajouter --site AC777 --gateway AC622 --tech 3G --nom "NOM"   # ajouter un site
+python main.py import nouveaux_sites.xlsx                        # ajouter plusieurs sites d'un coup
+python main.py charger AC777                                     # vérifier ce qui a été att
+
+
+
+
+
+Fichier	                                            Contient	                                                        Commande
+Gateway.xlsx (celui que tu as envoyé)	Les passerelles : Block d'adresse, Masque, Technology, Router Gateway...	    python main.py init
+Un autre fichier, que tu dois créer	   Les nouveaux sites à ajouter : Site ID, Router Gateway, Technology               python main.py import <ce fichier>
