@@ -410,3 +410,5 @@ def importer_gateways_depuis_excel(conn: sqlite3.Connection, gateway_path: str) 
             ),
         )
     conn.commit()
+
+    
